@@ -16,13 +16,20 @@ use stet_core::input::parse_keys;
 use stet_core::{Effect, Key, KeyEvent, Mode, Mods};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
-use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, StartCause, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key as WinitKey, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Fullscreen, Window, WindowId};
 
 /// Unsaved text is snapshotted this long after the last keystroke.
 const RECOVERY_DELAY: Duration = Duration::from_millis(800);
+/// A finger held still this long asks for the menu a right-click would.
+const HOLD: Duration = Duration::from_millis(500);
+/// A second tap, or click, this soon after the first makes a double.
+const DOUBLE: Duration = Duration::from_millis(450);
+/// A key held on an attached keyboard repeats after this long, then this often.
+#[cfg(target_os = "ios")]
+const REPEAT: (Duration, Duration) = (Duration::from_millis(400), Duration::from_millis(40));
 
 #[derive(Debug)]
 enum Wake {
@@ -43,6 +50,38 @@ enum Wake {
     /// A native menu item: key notation, or a `:command`.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Menu(String),
+    /// The on-screen keyboard came, went or changed size.
+    #[cfg(target_os = "ios")]
+    Keyboard,
+    /// A key of an attached keyboard that types no text went down; `None`
+    /// when the keys came back up.
+    #[cfg(target_os = "ios")]
+    HardKey(Option<KeyEvent>),
+}
+
+/// A finger on the screen.
+struct Finger {
+    id: u64,
+    start: (f32, f32),
+    began: Instant,
+    doing: Doing,
+    /// When and where it was last seen, and how fast it was moving down
+    /// the screen then, in pixels a second.
+    last: (Instant, f32),
+    speed: f32,
+}
+
+/// What a finger has turned out to be doing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Doing {
+    /// Down, and not yet moved: a tap if it lifts, the menu if it stays.
+    Undecided,
+    Scrolling,
+    /// Standing in for a held mouse button: dragging a selection, the line
+    /// beside the margin, or a tool across a picture.
+    Pointing,
+    /// Nothing more comes of it: it was held for the menu, or joined by another.
+    Spent,
 }
 
 struct Running {
@@ -53,6 +92,25 @@ struct Running {
     instance: wgpu::Instance,
     mods: ModifiersState,
     mouse: (f32, f32),
+    /// Where the view's top-left corner is in the window. Not the window's
+    /// own on a phone, where the view keeps clear of the screen's edges.
+    origin: (f32, f32),
+    finger: Option<Finger>,
+    /// When the finger that is down will have been held long enough.
+    hold_due: Option<Instant>,
+    /// The page still moving after a flick: pixels a second, and as of when.
+    glide: Option<(f32, Instant)>,
+    /// How much of a pinch has not yet become a step of zoom.
+    pinch: f64,
+    /// The writer tapped into the text, and has not sent the on-screen
+    /// keyboard away since.
+    keyboard_wanted: bool,
+    /// A key held down on an attached keyboard, and when it next repeats.
+    #[cfg(target_os = "ios")]
+    held_key: Option<(KeyEvent, Instant)>,
+    /// The document last noted as the one to come back to.
+    #[cfg(target_os = "ios")]
+    opened: Option<std::path::PathBuf>,
     dragging: bool,
     /// The line between the document and the margin is being dragged.
     splitting: bool,
@@ -77,6 +135,7 @@ struct Running {
 pub struct Prepared {
     editor: stet_core::Editor,
     fonts: std::thread::JoinHandle<Fonts>,
+    touch: bool,
 }
 
 /// Reads the config and document, and starts loading fonts on another
@@ -130,7 +189,11 @@ pub fn prepare(args: &Args) -> Prepared {
         crate::timing("fonts warm");
         fonts
     });
-    Prepared { editor, fonts }
+    Prepared {
+        editor,
+        fonts,
+        touch: args.touch || cfg!(target_os = "ios"),
+    }
 }
 
 struct Waiter {
@@ -183,6 +246,19 @@ pub fn run(args: Args) -> Result<(), String> {
         std::thread::spawn(move || {
             for line in std::io::stdin().lines().map_while(Result::ok) {
                 if proxy.send_event(Wake::Drive(line)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    if let Some(script) = args.script.clone() {
+        let proxy = proxy.clone();
+        std::thread::spawn(move || {
+            let lines = std::fs::read_to_string(script).unwrap_or_default();
+            for line in lines.lines() {
+                if let Some(pause) = line.strip_prefix("wait ") {
+                    std::thread::sleep(Duration::from_millis(pause.trim().parse().unwrap_or(0)));
+                } else if proxy.send_event(Wake::Drive(line.to_string())).is_err() {
                     break;
                 }
             }
@@ -242,7 +318,12 @@ fn map_key(event: &winit::event::KeyEvent, mods: ModifiersState) -> Option<KeyEv
             NamedKey::Space => Key::Char(' '),
             _ => return None,
         },
-        WinitKey::Character(text) => Key::Char(text.chars().next()?),
+        // An on-screen keyboard types its Return and Tab keys as text.
+        WinitKey::Character(text) => match text.chars().next()? {
+            '\n' | '\r' => Key::Enter,
+            '\t' => Key::Tab,
+            c => Key::Char(c),
+        },
         _ => return None,
     };
     Some(KeyEvent {
@@ -263,17 +344,23 @@ fn error(text: String) -> Option<Message> {
 impl Running {
     fn new(event_loop: &ActiveEventLoop, prepared: Prepared, proxy: EventLoopProxy<Wake>) -> Result<Running, String> {
         crate::timing("event loop ready");
-        let Prepared { mut editor, fonts } = prepared;
+        let Prepared {
+            mut editor,
+            fonts,
+            touch,
+        } = prepared;
         let state = platform::State::load();
         let size = state.window.unwrap_or((1040.0, 760.0));
-        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
-        let mut attributes = Window::default_attributes()
-            .with_title("Stet")
-            .with_inner_size(LogicalSize::new(
-                size.0.clamp(360.0, 8000.0),
-                size.1.clamp(240.0, 8000.0),
-            ))
-            .with_min_inner_size(LogicalSize::new(360.0, 240.0));
+        let mut attributes = Window::default_attributes().with_title("Stet");
+        // A phone's window is its screen, whatever that is at the moment.
+        if cfg!(not(target_os = "ios")) {
+            attributes = attributes
+                .with_inner_size(LogicalSize::new(
+                    size.0.clamp(360.0, 8000.0),
+                    size.1.clamp(240.0, 8000.0),
+                ))
+                .with_min_inner_size(LogicalSize::new(360.0, 240.0));
+        }
         #[cfg(target_os = "macos")]
         {
             use winit::platform::macos::WindowAttributesExtMacOS;
@@ -284,6 +371,13 @@ impl Running {
         }
         let window = Arc::new(event_loop.create_window(attributes).map_err(|err| err.to_string())?);
         crate::timing("window created");
+        #[cfg(target_os = "ios")]
+        {
+            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(RawWindowHandle::UiKit(handle)) = window.window_handle().map(|handle| handle.as_raw()) {
+                crate::ios::adopt(handle.ui_view.as_ptr());
+            }
+        }
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(Box::new(
             event_loop.owned_display_handle(),
@@ -294,7 +388,15 @@ impl Running {
             ..Default::default()
         }))
         .map_err(|err| format!("no graphics adapter: {err}"))?;
+        // The usual limits where the adapter has them; where it falls short
+        // of one (a simulated phone does), whatever it has instead.
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+            .or_else(|_| {
+                pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                    required_limits: adapter.limits(),
+                    ..Default::default()
+                }))
+            })
             .map_err(|err| err.to_string())?;
         let capabilities = surface.get_capabilities(&adapter);
         let format = capabilities
@@ -315,7 +417,7 @@ impl Running {
         } else {
             wgpu::PresentMode::AutoVsync
         };
-        let size = window.inner_size();
+        let size = surface_size(&window);
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -346,6 +448,7 @@ impl Running {
             crate::data::Data::new(wake.clone()),
         );
         view.scale = window.scale_factor() as f32;
+        view.touch = touch;
         view.zoom = state.zoom.unwrap_or(1.0).clamp(0.5, 4.0);
         view.titlebar = if cfg!(target_os = "macos") {
             28.0 * view.scale
@@ -356,6 +459,12 @@ impl Running {
         #[cfg(target_os = "macos")]
         {
             view.reduce_motion = crate::macos::reduce_motion();
+        }
+        #[cfg(target_os = "ios")]
+        {
+            use winit::platform::ios::WindowExtIOS;
+            view.reduce_motion = crate::ios::reduce_motion();
+            window.recognize_pinch_gesture(true);
         }
         let mut running = Running {
             session: Session {
@@ -373,6 +482,16 @@ impl Running {
             instance,
             mods: ModifiersState::empty(),
             mouse: (0.0, 0.0),
+            origin: (0.0, 0.0),
+            finger: None,
+            hold_due: None,
+            glide: None,
+            pinch: 0.0,
+            keyboard_wanted: false,
+            #[cfg(target_os = "ios")]
+            held_key: None,
+            #[cfg(target_os = "ios")]
+            opened: None,
             dragging: false,
             splitting: false,
             last_click: None,
@@ -387,6 +506,7 @@ impl Running {
             window,
         };
         crate::timing("renderer built");
+        running.layout();
         running.session.settle();
         running.after_input();
         crate::timing("ready for first frame");
@@ -397,9 +517,8 @@ impl Running {
         self.surface_config.width = width.max(1);
         self.surface_config.height = height.max(1);
         self.surface.configure(&self.gpu.device, &self.surface_config);
+        self.layout();
         let view = &mut self.session.view;
-        (view.width, view.height) = (width as f32, height as f32);
-        view.scale = self.window.scale_factor() as f32;
         view.titlebar = if cfg!(target_os = "macos") && self.window.fullscreen().is_none() {
             28.0 * view.scale
         } else {
@@ -407,6 +526,52 @@ impl Running {
         };
         view.follow_cursor(&mut self.session.editor);
         self.window.request_redraw();
+    }
+
+    /// Fits the view to the window: all of it on a desktop; on a phone, the
+    /// part clear of the camera, the home indicator and the on-screen
+    /// keyboard. Whatever the view lets bleed is drawn in the rest.
+    fn layout(&mut self) {
+        let (width, height) = (self.surface_config.width as f32, self.surface_config.height as f32);
+        // Left, top, right, bottom.
+        #[cfg_attr(not(target_os = "ios"), allow(unused_mut))]
+        let mut inset = [0.0f32; 4];
+        #[cfg(target_os = "ios")]
+        {
+            // Here the window's inner area is the part the system keeps clear.
+            if let (Ok(inner), Ok(outer)) = (self.window.inner_position(), self.window.outer_position()) {
+                let safe = self.window.inner_size();
+                let (left, top) = ((inner.x - outer.x) as f32, (inner.y - outer.y) as f32);
+                inset = [
+                    left,
+                    top,
+                    width - left - safe.width as f32,
+                    height - top - safe.height as f32,
+                ]
+                .map(|edge| edge.max(0.0));
+            }
+            let scale = self.window.scale_factor() as f32;
+            let covered = crate::ios::keyboard_overlap(self.ui_view()) * scale;
+            // An attached keyboard leaves only a strip of shortcuts on screen.
+            self.session.view.keyboard = covered > 120.0 * scale;
+            inset[3] = inset[3].max(covered);
+        }
+        self.origin = (inset[0], inset[1]);
+        let view = &mut self.session.view;
+        view.width = (width - inset[0] - inset[2]).max(1.0);
+        view.height = (height - inset[1] - inset[3]).max(1.0);
+        view.bleed = inset;
+        view.scale = self.window.scale_factor() as f32;
+    }
+
+    /// The `UIView` the window draws in.
+    #[cfg(target_os = "ios")]
+    fn ui_view(&self) -> *mut std::ffi::c_void {
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        match self.window.window_handle().map(|handle| handle.as_raw()) {
+            Ok(RawWindowHandle::UiKit(handle)) => handle.ui_view.as_ptr(),
+            _ => std::ptr::null_mut(),
+        }
     }
 
     /// Keeps the window chrome in step with the editor after any input.
@@ -428,14 +593,24 @@ impl Running {
             .retouch
             .as_ref()
             .is_some_and(|retouch| retouch.typing());
-        let ime = editor.mode == Mode::Insert
-            || editor.cmdline.is_some()
-            || editor.palette.is_some()
-            || editor.sheet.is_some()
-            || labelling;
+        let asked = editor.cmdline.is_some() || editor.palette.is_some() || editor.sheet.is_some() || labelling;
+        let ime = editor.mode == Mode::Insert || asked;
+        // Allowing composition is what raises the on-screen keyboard, which
+        // takes half a phone's screen: it comes for a tap in the text or a
+        // field to type in, and stays away while reading. (A keyboard with
+        // real keys is heard either way.)
+        #[cfg(target_os = "ios")]
+        let ime = asked || (ime && self.keyboard_wanted);
         if ime != self.ime_allowed {
             self.window.set_ime_allowed(ime);
             self.ime_allowed = ime;
+        }
+        // An app can be ended without a word: which document was open is
+        // noted when it changes, not on the way out.
+        #[cfg(target_os = "ios")]
+        if self.opened != self.session.editor.path {
+            self.opened = self.session.editor.path.clone();
+            self.save_state();
         }
         self.recovery_due = Some(Instant::now() + RECOVERY_DELAY);
         self.window.request_redraw();
@@ -455,6 +630,7 @@ impl Running {
         if !self.drawn {
             crate::timing("first redraw requested");
         }
+        self.glide();
         let frame = self.session.view.frame(&mut self.session.editor);
         if !self.drawn {
             crate::timing("first frame laid out");
@@ -483,7 +659,8 @@ impl Running {
         let target = texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let size = (self.surface_config.width, self.surface_config.height);
         let view = &mut self.session.view;
-        self.gpu.render(&target, size, &frame, &view.layouts, &mut view.fonts);
+        self.gpu
+            .render(&target, size, self.origin, &frame, &view.layouts, &mut view.fonts);
         self.gpu.queue.present(texture);
         if self.session.view.animating() {
             self.window.request_redraw();
@@ -555,11 +732,67 @@ impl Running {
         true
     }
 
+    #[cfg(not(target_os = "ios"))]
     fn quit(&mut self, event_loop: &ActiveEventLoop) {
         platform::stop_listening(self.listening);
         self.save_state();
         self.session.editor.shutdown();
         event_loop.exit();
+    }
+
+    /// An iOS app is not quit from inside: closing the last document leaves
+    /// an empty page, and the system ends the app when it wants the room.
+    #[cfg(target_os = "ios")]
+    fn quit(&mut self, _: &ActiveEventLoop) {
+        let editor = &mut self.session.editor;
+        editor.new_tab();
+        // Bounded: closing from a margin closes the margin first.
+        for _ in 0..256 {
+            if editor.tab_count() < 2 {
+                break;
+            }
+            editor.switch_tab(0);
+            editor.close_tab(true);
+        }
+        editor.take_effects();
+        self.session.settle();
+        self.save_state();
+        self.after_input();
+    }
+
+    /// What is done on the way out of the foreground, or of the window's
+    /// focus: nothing typed so far is lost if this is the last that is heard.
+    fn stepping_away(&mut self) {
+        let editor = &mut self.session.editor;
+        editor.autosave_margin();
+        editor.write_recovery();
+        // Nothing on a phone asks "save changes?": documents that have a
+        // place are kept as they go.
+        #[cfg(target_os = "ios")]
+        {
+            let said = editor.message.take();
+            let _ = editor.save_all();
+            editor.take_effects();
+            editor.message = said;
+            self.save_state();
+            self.window.request_redraw();
+        }
+    }
+
+    fn came_back(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            self.session.view.reduce_motion = crate::macos::reduce_motion();
+        }
+        #[cfg(target_os = "ios")]
+        {
+            self.session.view.reduce_motion = crate::ios::reduce_motion();
+        }
+        self.session.editor.check_disk();
+        self.session.editor.refresh_sidebar();
+        self.session.view.images.retry_failed();
+        self.session.settle();
+        self.after_input();
     }
 
     fn save_state(&self) {
@@ -570,7 +803,9 @@ impl Running {
             zoom: Some(self.session.view.zoom),
             prose_font: editor.config.prose_font.first().cloned(),
             mono_font: editor.config.mono_font.first().cloned(),
-            window: self.window.fullscreen().is_none().then_some((size.width, size.height)),
+            window: (self.window.fullscreen().is_none() && cfg!(not(target_os = "ios")))
+                .then_some((size.width, size.height)),
+            last: platform::remembered(editor.path.as_deref()),
             // Kept by the sheets that set them, not by the window.
             ..platform::State::load()
         }
@@ -591,13 +826,19 @@ impl Running {
                     if let Some(path) = platform::pick_file() {
                         self.open(&path);
                         queue.extend(self.session.settle());
+                    } else if cfg!(target_os = "ios") {
+                        // The app's folder is where its documents are.
+                        let editor = &mut self.session.editor;
+                        if !(editor.sidebar.visible && editor.sidebar.focused) {
+                            editor.toggle_sidebar();
+                        }
                     }
                 }
                 Effect::SaveAsDialog => {
                     self.save_as();
                 }
                 Effect::OpenUrl(url) => {
-                    if let Err(err) = open::that_detached(&url) {
+                    if let Err(err) = platform::open_url(&url) {
                         self.session.editor.message = error(format!("cannot open {url}: {err}"));
                     }
                 }
@@ -783,13 +1024,8 @@ impl Running {
 
     fn mouse_press(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
-        let near = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).abs() < 6.0 && (a.1 - b.1).abs() < 6.0;
         let clicks = match self.last_click {
-            Some((at, place, clicks))
-                if now - at < Duration::from_millis(450) && near(place, self.mouse) && clicks < 3 =>
-            {
-                clicks + 1
-            }
+            Some((at, place, clicks)) if now - at < DOUBLE && self.near(place, self.mouse) && clicks < 3 => clicks + 1,
             _ => 1,
         };
         self.last_click = Some((now, self.mouse, clicks));
@@ -820,6 +1056,11 @@ impl Running {
             Some(Target::SidebarRow(index)) => editor.sidebar_click(index, command),
             Some(Target::Sidebar) => editor.sidebar.focused = true,
             Some(Target::MenuHint) => editor.open_palette(PaletteKind::Help),
+            Some(Target::KeyboardDone) => self.keyboard_wanted = false,
+            Some(Target::SidebarScrim) => {
+                editor.sidebar.visible = false;
+                editor.sidebar.focused = false;
+            }
             Some(Target::Note(index)) => editor.open_note(index),
             Some(Target::DataRef(index)) => session.view.toggle_preview(index),
             Some(Target::Fold(at)) => editor.fold(&(at + 1).to_string(), Fold::Toggle),
@@ -831,7 +1072,7 @@ impl Running {
             Some(Target::Video(index)) => {
                 // Played by whatever plays videos here.
                 if let Some(video) = session.view.video(index)
-                    && let Err(err) = open::that_detached(video)
+                    && let Err(err) = platform::open_url(video)
                 {
                     editor.message = error(format!("cannot open {video}: {err}"));
                 }
@@ -875,6 +1116,165 @@ impl Running {
         session.view.goal_x = None;
         let effects = session.settle();
         self.effects(effects, event_loop);
+    }
+
+    /// True if two presses are close enough to be one place pressed twice:
+    /// within a few pixels for a pointer, a fingertip for a finger.
+    fn near(&self, a: (f32, f32), b: (f32, f32)) -> bool {
+        let reach = if self.session.view.touch {
+            28.0 * self.session.view.scale
+        } else {
+            6.0
+        };
+        (a.0 - b.0).abs() < reach && (a.1 - b.1).abs() < reach
+    }
+
+    /// A finger came down, moved or lifted, at a place in the window.
+    fn touch(&mut self, id: u64, phase: TouchPhase, x: f32, y: f32, event_loop: &ActiveEventLoop) {
+        let (x, y) = (x - self.origin.0, y - self.origin.1);
+        let now = Instant::now();
+        if phase == TouchPhase::Started {
+            self.glide = None;
+            if let Some(first) = &mut self.finger {
+                // Two fingers are a pinch, or a mistake; neither is a tap.
+                if std::mem::replace(&mut first.doing, Doing::Spent) == Doing::Pointing {
+                    self.mouse_release();
+                }
+                self.hold_due = None;
+                return;
+            }
+            self.mouse_move(x, y);
+            // What is dragged with a held button is dragged with a held finger.
+            let grabbed = self.session.view.retouch.is_some()
+                || matches!(self.session.view.target_at(x, y), Some(Target::Divider));
+            if grabbed {
+                self.mouse_press(event_loop);
+            } else {
+                self.hold_due = Some(now + HOLD);
+            }
+            self.finger = Some(Finger {
+                id,
+                start: (x, y),
+                began: now,
+                doing: if grabbed { Doing::Pointing } else { Doing::Undecided },
+                last: (now, y),
+                speed: 0.0,
+            });
+            return;
+        }
+        let Some(mut finger) = self.finger.take_if(|finger| finger.id == id) else {
+            return;
+        };
+        if phase == TouchPhase::Moved {
+            let slop = 10.0 * self.session.view.scale;
+            if finger.doing == Doing::Undecided
+                && ((x - finger.start.0).abs() > slop || (y - finger.start.1).abs() > slop)
+            {
+                self.hold_due = None;
+                // A second tap that goes on to move drags a selection out
+                // from the word under it; any other moving finger scrolls.
+                let again = self.last_click.is_some_and(|(at, place, _)| {
+                    finger.began.saturating_duration_since(at) < DOUBLE && self.near(place, finger.start)
+                });
+                let on_text = self.session.view.target_at(finger.start.0, finger.start.1).is_none();
+                if again && on_text {
+                    self.mouse_press(event_loop);
+                    finger.doing = Doing::Pointing;
+                } else {
+                    finger.doing = Doing::Scrolling;
+                    finger.last = (now, y);
+                }
+            }
+            match finger.doing {
+                Doing::Scrolling => {
+                    let (then, was) = finger.last;
+                    let elapsed = now.saturating_duration_since(then).as_secs_f32();
+                    if elapsed > 0.0 {
+                        // Smoothed, so one late event does not set the pace of the glide.
+                        finger.speed = finger.speed * 0.4 + (was - y) / elapsed * 0.6;
+                    }
+                    finger.last = (now, y);
+                    self.wheel(was - y);
+                }
+                Doing::Pointing => self.mouse_move(x, y),
+                Doing::Undecided | Doing::Spent => {}
+            }
+            self.finger = Some(finger);
+            return;
+        }
+        // Lifted, or taken away by the system.
+        self.hold_due = None;
+        match finger.doing {
+            Doing::Undecided if phase == TouchPhase::Ended => self.tap(event_loop),
+            Doing::Scrolling => {
+                let flicked = now.saturating_duration_since(finger.last.0) < Duration::from_millis(80)
+                    && finger.speed.abs() > 120.0 * self.session.view.scale;
+                if phase == TouchPhase::Ended && flicked && !self.session.view.reduce_motion {
+                    self.glide = Some((finger.speed, now));
+                    self.window.request_redraw();
+                }
+            }
+            Doing::Pointing => self.mouse_release(),
+            Doing::Undecided | Doing::Spent => {}
+        }
+    }
+
+    /// A finger touched a place and lifted: a click there, which in the
+    /// text also asks for the keyboard.
+    fn tap(&mut self, event_loop: &ActiveEventLoop) {
+        let view = &self.session.view;
+        let target = view.target_at(self.mouse.0, self.mouse.1);
+        let drawer = view.drawer();
+        if target.is_none() && view.retouch.is_none() {
+            self.keyboard_wanted = true;
+            // Asked for again even if it is thought to be up: the system
+            // may have put it away since.
+            self.ime_allowed = false;
+        }
+        self.mouse_press(event_loop);
+        self.mouse_release();
+        // A document chosen from the drawer puts the drawer away.
+        let sidebar = &mut self.session.editor.sidebar;
+        if drawer && matches!(target, Some(Target::SidebarRow(_))) && !sidebar.focused {
+            sidebar.visible = false;
+        }
+        self.after_input();
+    }
+
+    /// The finger has stayed where it came down: the menu for what is under it.
+    fn held(&mut self, event_loop: &ActiveEventLoop) {
+        self.hold_due = None;
+        if let Some(finger) = self.finger.as_mut().filter(|finger| finger.doing == Doing::Undecided) {
+            finger.doing = Doing::Spent;
+            self.context_click(event_loop);
+        }
+    }
+
+    /// Moves the page on after a flick, slowing as it goes.
+    fn glide(&mut self) {
+        let Some((speed, then)) = self.glide.take() else { return };
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(then).as_secs_f32().min(0.05);
+        self.wheel(speed * elapsed);
+        let speed = speed * (-2.4 * elapsed).exp();
+        if speed.abs() > 24.0 * self.session.view.scale {
+            self.glide = Some((speed, now));
+        }
+    }
+
+    /// Two fingers moved apart or together: the text grows or shrinks, a
+    /// step at a time.
+    fn pinch(&mut self, delta: f64) {
+        self.pinch += delta;
+        let steps = (self.pinch / 0.1).trunc();
+        if steps != 0.0 {
+            self.pinch -= steps * 0.1;
+            let view = &mut self.session.view;
+            view.set_zoom(steps as i32);
+            view.follow_cursor(&mut self.session.editor);
+            self.save_state();
+            self.window.request_redraw();
+        }
     }
 
     /// A right-click: the menu for whatever is under the pointer.
@@ -1082,6 +1482,26 @@ impl Running {
                     eprintln!("stet: shot: {err}");
                 }
             }
+            // A finger: `tap x y`, `hold x y`, `swipe x0 y0 x1 y1`.
+            "tap" | "hold" | "swipe" => {
+                let (from, to) = (point(0), if command == "swipe" { point(2) } else { point(0) });
+                let at = |(x, y): (f32, f32)| (x + self.origin.0, y + self.origin.1);
+                let (from, to) = (at(from), at(to));
+                self.touch(0, TouchPhase::Started, from.0, from.1, event_loop);
+                for step in 1..=8 {
+                    let t = step as f32 / 8.0;
+                    if command == "swipe" {
+                        let (x, y) = (from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t);
+                        self.touch(0, TouchPhase::Moved, x, y, event_loop);
+                    }
+                }
+                if command == "hold" {
+                    self.held(event_loop);
+                }
+                self.touch(0, TouchPhase::Ended, to.0, to.1, event_loop);
+                // A scripted swipe ends where it ends, with no glide after.
+                self.glide = None;
+            }
             "quit" => self.quit(event_loop),
             _ => {}
         }
@@ -1094,7 +1514,7 @@ impl Running {
             WindowEvent::Resized(size) => self.resize(size.width, size.height),
             WindowEvent::ScaleFactorChanged { .. } => {
                 self.session.view.invalidate();
-                let size = self.window.inner_size();
+                let size = surface_size(&self.window);
                 self.resize(size.width, size.height);
             }
             WindowEvent::RedrawRequested => self.redraw(),
@@ -1122,7 +1542,17 @@ impl Running {
                 let effects = self.session.text(&text);
                 self.effects(effects, event_loop);
             }
-            WindowEvent::CursorMoved { position, .. } => self.mouse_move(position.x as f32, position.y as f32),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.mouse_move(position.x as f32 - self.origin.0, position.y as f32 - self.origin.1)
+            }
+            WindowEvent::Touch(touch) if self.session.view.touch => self.touch(
+                touch.id,
+                touch.phase,
+                touch.location.x as f32,
+                touch.location.y as f32,
+                event_loop,
+            ),
+            WindowEvent::PinchGesture { delta, .. } if self.session.view.touch => self.pinch(delta),
             WindowEvent::MouseInput {
                 state,
                 button: MouseButton::Left,
@@ -1145,21 +1575,8 @@ impl Running {
                 });
             }
             WindowEvent::DroppedFile(path) => self.drop_file(&path, event_loop),
-            WindowEvent::Focused(true) => {
-                #[cfg(target_os = "macos")]
-                {
-                    self.session.view.reduce_motion = crate::macos::reduce_motion();
-                }
-                self.session.editor.check_disk();
-                self.session.editor.refresh_sidebar();
-                self.session.view.images.retry_failed();
-                self.session.settle();
-                self.after_input();
-            }
-            WindowEvent::Focused(false) => {
-                self.session.editor.autosave_margin();
-                self.session.editor.write_recovery();
-            }
+            WindowEvent::Focused(true) => self.came_back(),
+            WindowEvent::Focused(false) => self.stepping_away(),
             _ => {}
         }
     }
@@ -1167,7 +1584,11 @@ impl Running {
 
 impl ApplicationHandler<Wake> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.running.is_some() {
+        if let Some(running) = &mut self.running {
+            // Back in the foreground, on the platforms that have one.
+            if cfg!(target_os = "ios") {
+                running.came_back();
+            }
             return;
         }
         let Some(prepared) = self.prepared.take() else { return };
@@ -1180,6 +1601,10 @@ impl ApplicationHandler<Wake> for App {
                 }
             }
             Err(err) => {
+                // Said now as well: an iOS event loop never returns to say it.
+                if cfg!(target_os = "ios") {
+                    eprintln!("stet: {err}");
+                }
                 self.error = Some(err);
                 event_loop.exit();
             }
@@ -1189,6 +1614,12 @@ impl ApplicationHandler<Wake> for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         if let Some(running) = &mut self.running {
             running.event(event, event_loop);
+        }
+    }
+
+    fn suspended(&mut self, _: &ActiveEventLoop) {
+        if let Some(running) = &mut self.running {
+            running.stepping_away();
         }
     }
 
@@ -1228,6 +1659,24 @@ impl ApplicationHandler<Wake> for App {
                 running.window.request_redraw()
             }
             Wake::Drive(line) => running.drive(&line, event_loop),
+            #[cfg(target_os = "ios")]
+            Wake::Keyboard => {
+                running.layout();
+                if !running.session.view.keyboard {
+                    // Put away, perhaps by the system's own key: it is not
+                    // brought back until the text is tapped again.
+                    running.keyboard_wanted = false;
+                }
+                running.session.view.follow_cursor(&mut running.session.editor);
+                running.after_input();
+            }
+            #[cfg(target_os = "ios")]
+            Wake::HardKey(key) => {
+                running.held_key = key.map(|key| (key, Instant::now() + REPEAT.0));
+                if let Some(key) = key {
+                    running.key(key, event_loop);
+                }
+            }
             Wake::Request(id, request, reply) => running.request(id, &request, reply, event_loop),
             Wake::Gone(id) => {
                 running.waiters.retain(|waiter| waiter.id != id);
@@ -1237,17 +1686,63 @@ impl ApplicationHandler<Wake> for App {
         }
     }
 
-    fn new_events(&mut self, _: &ActiveEventLoop, cause: StartCause) {
-        if let (StartCause::ResumeTimeReached { .. }, Some(running)) = (cause, &mut self.running) {
+    #[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
+        #[cfg(target_os = "ios")]
+        if cause == StartCause::Init {
+            // The application object exists from here on.
+            let to_loop = self.proxy.clone();
+            crate::ios::install(move |event| {
+                let _ = to_loop.send_event(match event {
+                    crate::ios::AppEvent::Open(files) => Wake::Opened(files),
+                    crate::ios::AppEvent::Keyboard => Wake::Keyboard,
+                    crate::ios::AppEvent::Key(key) => Wake::HardKey(key),
+                });
+            });
+        }
+        let (StartCause::ResumeTimeReached { .. }, Some(running)) = (cause, &mut self.running) else {
+            return;
+        };
+        // Whichever of the things waited for have come due.
+        let now = Instant::now();
+        let due = |at: Option<Instant>| at.is_some_and(|at| at <= now);
+        if due(running.recovery_due) {
             running.recovery_due = None;
             running.session.editor.autosave_margin();
             running.session.editor.write_recovery();
         }
+        if due(running.hold_due) {
+            running.held(event_loop);
+        }
+        #[cfg(target_os = "ios")]
+        if let Some((key, _)) = running.held_key.filter(|(_, at)| *at <= now) {
+            running.held_key = Some((key, now + REPEAT.1));
+            running.key(key, event_loop);
+        }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let due = self.running.as_ref().and_then(|running| running.recovery_due);
+        let due = self.running.as_ref().and_then(|running| {
+            #[cfg(target_os = "ios")]
+            let repeat = running.held_key.map(|(_, at)| at);
+            #[cfg(not(target_os = "ios"))]
+            let repeat = None;
+            [running.recovery_due, running.hold_due, repeat]
+                .into_iter()
+                .flatten()
+                .min()
+        });
         event_loop.set_control_flow(due.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
+    }
+}
+
+/// The size to draw at: the window's content area, which on iOS is the
+/// whole window (its inner area there is the part clear of the screen's edges).
+fn surface_size(window: &Window) -> winit::dpi::PhysicalSize<u32> {
+    if cfg!(target_os = "ios") {
+        window.outer_size()
+    } else {
+        window.inner_size()
     }
 }
 
@@ -1259,8 +1754,12 @@ fn headless_session(args: &Args) -> Session {
     data.blocking = true;
     let mut view = View::new(Fonts::new(&editor.config, &font_dirs), images, data);
     view.scale = args.scale;
-    view.width = (args.size.0 as f32 * args.scale).round();
-    view.height = (args.size.1 as f32 * args.scale).round();
+    view.touch = args.touch;
+    // The picture is of the whole screen; the view keeps clear of its edges.
+    view.bleed = args.safe.map(|edge| (edge * args.scale).round());
+    let [left, top, right, bottom] = view.bleed;
+    view.width = ((args.size.0 as f32 * args.scale).round() - left - right).max(1.0);
+    view.height = ((args.size.1 as f32 * args.scale).round() - top - bottom).max(1.0);
     #[cfg(feature = "substack")]
     let publish = {
         let mut publish = crate::publish::Publisher::new(no_wake());
@@ -1317,7 +1816,11 @@ pub fn screenshot(args: &Args) -> Result<(), String> {
 /// Renders the session's current frame into a PNG.
 fn capture(gpu: &mut Gpu, session: &mut Session, out: &Path) -> Result<(), String> {
     let frame = session.view.frame(&mut session.editor);
-    let (width, height) = (session.view.width as u32, session.view.height as u32);
+    let [left, top, right, bottom] = session.view.bleed;
+    let (width, height) = (
+        (session.view.width + left + right) as u32,
+        (session.view.height + top + bottom) as u32,
+    );
     let format = gpu.format;
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: None,
@@ -1337,6 +1840,7 @@ fn capture(gpu: &mut Gpu, session: &mut Session, out: &Path) -> Result<(), Strin
     gpu.render(
         &target,
         (width, height),
+        (left, top),
         &frame,
         &session.view.layouts,
         &mut session.view.fonts,
@@ -1505,6 +2009,7 @@ pub fn bench(args: &Args) {
         gpu.render(
             &target,
             (width, height),
+            (0.0, 0.0),
             &frame,
             &session.view.layouts,
             &mut session.view.fonts,
@@ -1514,6 +2019,7 @@ pub fn bench(args: &Args) {
         gpu.render(
             &target,
             (width, height),
+            (0.0, 0.0),
             &frame,
             &session.view.layouts,
             &mut session.view.fonts,

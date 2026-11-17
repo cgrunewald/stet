@@ -9,7 +9,7 @@ use glyphon::{Cache, Resolution, TextArea, TextAtlas, TextBounds, TextRenderer, 
 use std::collections::HashMap;
 
 const SHADER: &str = r#"
-struct Globals { size: vec2<f32>, pad: vec2<f32> };
+struct Globals { size: vec2<f32>, origin: vec2<f32> };
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(1) @binding(0) var tex: texture_2d<f32>;
 @group(1) @binding(1) var samp: sampler;
@@ -33,7 +33,8 @@ struct VOut {
 
 @vertex fn vs(in: VIn) -> VOut {
     var out: VOut;
-    out.clip = vec4<f32>(in.pos.x / globals.size.x * 2.0 - 1.0, 1.0 - in.pos.y / globals.size.y * 2.0, 0.0, 1.0);
+    let at = in.pos + globals.origin;
+    out.clip = vec4<f32>(at.x / globals.size.x * 2.0 - 1.0, 1.0 - at.y / globals.size.y * 2.0, 0.0, 1.0);
     out.local = in.local;
     out.half = in.half;
     out.color = in.color;
@@ -248,10 +249,14 @@ impl Gpu {
         }
     }
 
+    /// Draws `frame` into `target`, which is `size` pixels. The frame's own
+    /// top-left corner goes at `origin`: on a phone the view sits inside the
+    /// screen's safe area, and only what it lets bleed is drawn outside.
     pub fn render(
         &mut self,
         target: &wgpu::TextureView,
         size: (u32, u32),
+        origin: (f32, f32),
         frame: &Frame,
         layouts: &HashMap<u64, LineLayout>,
         fonts: &mut Fonts,
@@ -260,7 +265,7 @@ impl Gpu {
         self.queue.write_buffer(
             &self.globals,
             0,
-            bytemuck::cast_slice(&[width as f32, height as f32, 0.0, 0.0]),
+            bytemuck::cast_slice(&[width as f32, height as f32, origin.0, origin.1]),
         );
 
         // One vertex buffer; per layer: back quads, one quad per image, front quads.
@@ -311,15 +316,15 @@ impl Gpu {
                 .filter_map(|item| layouts.get(&item.key).map(|layout| (item, layout)));
             let areas = areas.flat_map(|(item, layout)| {
                 let bounds = TextBounds {
-                    left: item.clip[0] as i32,
-                    top: item.clip[1] as i32,
-                    right: item.clip[2] as i32,
-                    bottom: item.clip[3] as i32,
+                    left: (item.clip[0] + origin.0) as i32,
+                    top: (item.clip[1] + origin.1) as i32,
+                    right: (item.clip[2] + origin.0) as i32,
+                    bottom: (item.clip[3] + origin.1) as i32,
                 };
                 let area = move |buffer, x: f32, y: f32| TextArea {
                     buffer,
-                    left: item.left + x,
-                    top: item.top + y,
+                    left: item.left + x + origin.0,
+                    top: item.top + y + origin.1,
                     scale: 1.0,
                     bounds,
                     default_color: item.color,
@@ -375,6 +380,7 @@ impl Gpu {
                 pass.draw(back, 0..1);
                 if !images.is_empty() {
                     let [x, y, w, h] = layers[index].image_clip;
+                    let (x, y) = (x + origin.0, y + origin.1);
                     let (x, y) = ((x.max(0.0) as u32).min(width), (y.max(0.0) as u32).min(height));
                     pass.set_scissor_rect(
                         x,

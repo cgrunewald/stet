@@ -1,12 +1,15 @@
 //! The few things that differ per OS: clipboard, config location, dialogs.
 
 use std::path::PathBuf;
+#[cfg(not(target_os = "ios"))]
 use stet_core::{Clip, Clipboard};
 
 /// The system clipboard. Opened lazily: some platforms block on first use.
+#[cfg(not(target_os = "ios"))]
 #[derive(Default)]
 pub struct SystemClipboard(Option<arboard::Clipboard>);
 
+#[cfg(not(target_os = "ios"))]
 impl SystemClipboard {
     fn handle(&mut self) -> Option<&mut arboard::Clipboard> {
         if self.0.is_none() {
@@ -16,6 +19,7 @@ impl SystemClipboard {
     }
 }
 
+#[cfg(not(target_os = "ios"))]
 impl Clipboard for SystemClipboard {
     fn get(&mut self) -> Option<String> {
         self.handle()?.get_text().ok()
@@ -58,74 +62,139 @@ impl Clipboard for SystemClipboard {
     }
 }
 
-/// `~/.config/stet` on Linux and macOS, `%APPDATA%\stet` on Windows.
+#[cfg(target_os = "ios")]
+pub use crate::ios::Pasteboard as SystemClipboard;
+
+/// `~/.config/stet` on Linux and macOS, `%APPDATA%\stet` on Windows, and
+/// the app's own Application Support folder on iOS.
 pub fn config_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("STET_CONFIG_DIR") {
         return Some(PathBuf::from(dir));
     }
-    let dirs = directories::BaseDirs::new()?;
-    Some(if cfg!(windows) {
-        dirs.config_dir().join("stet")
-    } else {
-        dirs.home_dir().join(".config").join("stet")
-    })
+    #[cfg(target_os = "ios")]
+    return crate::ios::support_dir();
+    #[cfg(not(target_os = "ios"))]
+    {
+        let dirs = directories::BaseDirs::new()?;
+        Some(if cfg!(windows) {
+            dirs.config_dir().join("stet")
+        } else {
+            dirs.home_dir().join(".config").join("stet")
+        })
+    }
 }
 
-pub fn pick_file() -> Option<PathBuf> {
-    rfd::FileDialog::new()
-        .add_filter("Markdown", &["md", "markdown", "mdown", "txt"])
-        .add_filter("All files", &["*"])
-        .pick_file()
-}
-
-pub fn pick_save(name: &str) -> Option<PathBuf> {
-    rfd::FileDialog::new()
-        .set_file_name(if name == "Untitled" { "Untitled.md" } else { name })
-        .save_file()
+/// Opens a link, or a file stet does not show itself, in the app the system
+/// keeps for it.
+pub fn open_url(target: &str) -> Result<(), String> {
+    #[cfg(target_os = "ios")]
+    return crate::ios::open_url(target);
+    #[cfg(not(target_os = "ios"))]
+    open::that_detached(target).map_err(|err| err.to_string())
 }
 
 #[derive(PartialEq, Eq)]
+#[cfg_attr(target_os = "ios", allow(dead_code))]
 pub enum Unsaved {
     Save,
     Discard,
     Cancel,
 }
 
-pub fn confirm_unsaved(name: &str) -> Unsaved {
-    let answer = rfd::MessageDialog::new()
-        .set_level(rfd::MessageLevel::Warning)
-        .set_title("Unsaved changes")
-        .set_description(format!("Save changes to {name} before closing?"))
-        .set_buttons(rfd::MessageButtons::YesNoCancel)
-        .show();
-    match answer {
-        rfd::MessageDialogResult::Yes => Unsaved::Save,
-        rfd::MessageDialogResult::No => Unsaved::Discard,
-        _ => Unsaved::Cancel,
+#[cfg(not(target_os = "ios"))]
+mod dialogs {
+    use super::Unsaved;
+    use std::path::PathBuf;
+
+    pub fn pick_file() -> Option<PathBuf> {
+        rfd::FileDialog::new()
+            .add_filter("Markdown", &["md", "markdown", "mdown", "txt"])
+            .add_filter("All files", &["*"])
+            .pick_file()
+    }
+
+    pub fn pick_save(name: &str) -> Option<PathBuf> {
+        rfd::FileDialog::new()
+            .set_file_name(if name == "Untitled" { "Untitled.md" } else { name })
+            .save_file()
+    }
+
+    pub fn confirm_unsaved(name: &str) -> Unsaved {
+        let answer = rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title("Unsaved changes")
+            .set_description(format!("Save changes to {name} before closing?"))
+            .set_buttons(rfd::MessageButtons::YesNoCancel)
+            .show();
+        match answer {
+            rfd::MessageDialogResult::Yes => Unsaved::Save,
+            rfd::MessageDialogResult::No => Unsaved::Discard,
+            _ => Unsaved::Cancel,
+        }
+    }
+
+    /// True if the user would write over a file that changed on disk.
+    pub fn confirm_overwrite(name: &str) -> bool {
+        let answer = rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title("File changed on disk")
+            .set_description(format!(
+                "{name} was changed by something else since you opened it. Save your version over it?"
+            ))
+            .set_buttons(rfd::MessageButtons::OkCancelCustom(
+                "Save Over It".into(),
+                "Cancel".into(),
+            ))
+            .show();
+        answer == rfd::MessageDialogResult::Custom("Save Over It".into())
     }
 }
 
-/// True if the user would write over a file that changed on disk.
-pub fn confirm_overwrite(name: &str) -> bool {
-    let answer = rfd::MessageDialog::new()
-        .set_level(rfd::MessageLevel::Warning)
-        .set_title("File changed on disk")
-        .set_description(format!(
-            "{name} was changed by something else since you opened it. Save your version over it?"
-        ))
-        .set_buttons(rfd::MessageButtons::OkCancelCustom(
-            "Save Over It".into(),
-            "Cancel".into(),
-        ))
-        .show();
-    answer == rfd::MessageDialogResult::Custom("Save Over It".into())
+/// iOS has no dialogs to stop and ask with. Documents live in the app's
+/// folder, which the file browser shows; closing one keeps what was written.
+#[cfg(target_os = "ios")]
+mod dialogs {
+    use super::Unsaved;
+    use std::path::PathBuf;
+
+    /// Nothing to pick with: the shell shows the file browser instead.
+    pub fn pick_file() -> Option<PathBuf> {
+        None
+    }
+
+    /// A free name in the app's folder: `Untitled.md`, `Untitled 2.md`, …
+    pub fn pick_save(name: &str) -> Option<PathBuf> {
+        let dir = crate::ios::documents_dir()?;
+        let name = if name == "Untitled" { "Untitled.md" } else { name };
+        let (stem, extension) = name.rsplit_once('.').unwrap_or((name, "md"));
+        (1..1000)
+            .map(|count| match count {
+                1 => dir.join(format!("{stem}.{extension}")),
+                _ => dir.join(format!("{stem} {count}.{extension}")),
+            })
+            .find(|path| !path.exists())
+    }
+
+    pub fn confirm_unsaved(_: &str) -> Unsaved {
+        Unsaved::Save
+    }
+
+    /// Never over someone else's change without being told to: `:w!` says so.
+    pub fn confirm_overwrite(_: &str) -> bool {
+        false
+    }
 }
+
+pub use dialogs::{confirm_overwrite, confirm_unsaved, pick_file, pick_save};
 
 /// Downloaded images are kept here between runs.
 pub fn cache_dir() -> Option<PathBuf> {
     if std::env::var_os("STET_CONFIG_DIR").is_some() {
         return config_dir().map(|dir| dir.join("cache"));
     }
+    #[cfg(target_os = "ios")]
+    return crate::ios::cache_dir();
+    #[cfg(not(target_os = "ios"))]
     Some(directories::BaseDirs::new()?.cache_dir().join("stet"))
 }
 
@@ -147,6 +216,8 @@ pub struct State {
     /// Whether publishing uploads local videos to YouTube (`youtube`, the
     /// default) or leaves them as links to the file (`link`).
     pub videos: Option<String>,
+    /// The document that was open, where launching opens no file by name.
+    pub last: Option<PathBuf>,
 }
 
 impl State {
@@ -184,7 +255,39 @@ impl State {
     }
 }
 
+/// How the open document is written down to come back to: within the app's
+/// own folder by its path from there, since the folder itself is somewhere
+/// else after every update. Only iOS, where no launch names a file, keeps one.
+pub fn remembered(path: Option<&std::path::Path>) -> Option<PathBuf> {
+    #[cfg(target_os = "ios")]
+    {
+        let home = crate::ios::documents_dir()?;
+        let path = path?;
+        Some(path.strip_prefix(&home).unwrap_or(path).to_path_buf())
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// The document `remembered` wrote down, if it is still there.
+pub fn recalled(last: Option<&std::path::Path>) -> Option<PathBuf> {
+    #[cfg(target_os = "ios")]
+    {
+        let path = crate::ios::documents_dir()?.join(last?);
+        path.exists().then_some(path)
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        let _ = last;
+        None
+    }
+}
+
 /// Where a running stet listens for files to open.
+#[cfg_attr(target_os = "ios", allow(dead_code))]
 pub fn socket_path() -> Option<PathBuf> {
     let socket = config_dir()?.join("stet.sock");
     // Socket addresses are short (about 100 bytes); a deep config folder
@@ -203,7 +306,7 @@ pub fn socket_path() -> Option<PathBuf> {
 
 /// Sends one request line to the stet that is already running and returns
 /// its reply. `None` if none is running.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "ios")))]
 pub fn request(line: &str, patient: bool) -> Option<String> {
     use std::io::{BufRead, BufReader, Write};
     let mut stream = std::os::unix::net::UnixStream::connect(socket_path()?).ok()?;
@@ -216,7 +319,7 @@ pub fn request(line: &str, patient: bool) -> Option<String> {
     (!reply.is_empty()).then_some(reply)
 }
 
-#[cfg(not(unix))]
+#[cfg(any(not(unix), target_os = "ios"))]
 pub fn request(_: &str, _: bool) -> Option<String> {
     None
 }
@@ -224,7 +327,7 @@ pub fn request(_: &str, _: bool) -> Option<String> {
 /// Answers requests from later `stet` launches and from `stet ctl`, one line in
 /// and one line out, calling `answer` for each with a way to ask whether
 /// the caller is still there. False if another stet is already listening.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "ios")))]
 pub fn listen(answer: impl Fn(String, &dyn Fn() -> bool) -> String + Send + Sync + 'static) -> bool {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
@@ -271,12 +374,13 @@ pub fn listen(answer: impl Fn(String, &dyn Fn() -> bool) -> String + Send + Sync
     true
 }
 
-#[cfg(not(unix))]
+#[cfg(any(not(unix), target_os = "ios"))]
 pub fn listen(_: impl Fn(String, &dyn Fn() -> bool) -> String + Send + Sync + 'static) -> bool {
     false
 }
 
 /// Removes the listening socket if this process owns it.
+#[cfg_attr(target_os = "ios", allow(dead_code))]
 pub fn stop_listening(owned: bool) {
     if let (true, Some(socket)) = (owned, socket_path()) {
         let _ = std::fs::remove_file(socket);

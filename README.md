@@ -64,6 +64,20 @@ sh scripts/install.sh        # builds stet into ~/.cargo/bin, links the skill
 cargo run --release -- examples/tour.md
 ```
 
+### iPhone and iPad
+
+Stet runs on iPhone, the folding iPhone Duo and iPad, built from source for
+now (needs Xcode, and `rustup target add aarch64-apple-ios aarch64-apple-ios-sim`):
+
+```sh
+make ios-run     # build for the simulator that is running, install and start it
+make ios         # Stet.app for a device, in target/bundle-ios
+```
+
+`make ios` signs the app if `STET_IOS_IDENTITY` and `STET_IOS_PROFILE` name a
+signing identity and a provisioning profile; `scripts/bundle-ios.sh` has the
+details. See [On iPhone and iPad](#manual) in the manual for how it differs.
+
 ## A tour
 
 <table>
@@ -194,6 +208,40 @@ few milliseconds instead of starting again (`-n` forces a separate window).
 
 Press **Cmd-/** (Ctrl-/ elsewhere, or F1) for the menu: every command with its
 shortcut, markdown syntax you can insert, and the vim keys. Type to filter.
+
+</details>
+
+<details>
+<summary><b>On iPhone and iPad</b></summary>
+
+The same editor, laid out for whatever screen it is given at the moment: an
+iPhone, either face of an iPhone Duo as it folds and unfolds, an iPad whole or
+sharing its screen. Nothing is fixed to a device; the view is fitted to the
+window each time the window changes.
+
+- **Tap** places the cursor and raises the keyboard; **done** in the status
+  line puts it away, and **menu** beside it opens the command menu.
+- **Drag** scrolls, and a flick keeps going; **pinch** changes the text size.
+- **Tap twice** selects a word and three times a paragraph; keep the second
+  tap down and drag to select further.
+- **Touch and hold** opens the menu a right-click does.
+- On a screen narrower than 600 points the file browser is a drawer over the
+  page, and the margin takes the page's place rather than half of it. Wider
+  (an iPad, an open iPhone Duo), they stand beside the document as on a desktop.
+- Documents live in the app's own folder, which Files shows as **Stet**.
+  Documents with a name are saved when you leave the app; closing an untitled
+  one saves it there as `Untitled.md`. Markdown files open in Stet from Files
+  and from other apps, in place.
+- With a keyboard attached, the shortcuts are the Mac's. Vim keys are off
+  until asked for (`:vim`, or `vim = true` in the config).
+
+Not there: `stet ctl` and assistants, running notebook cells, and file
+dialogs (`:w name.md` saves under a name). `config.toml`, themes and fonts are
+read from the app's `Library/Application Support/stet` folder.
+
+`stet --touch` gives a desktop window the same layout and gestures, and
+`--screenshot` takes `--safe left,top,right,bottom` to draw a screen with a
+camera housing and a home indicator to keep clear of.
 
 </details>
 
@@ -687,8 +735,13 @@ drag 100 100 400 300   # a fifth number begins it with a double (2) or triple (3
 scroll 300 300 240
 resize 900 700
 shot /tmp/frame.png    # what the window shows now
+tap 300 200            # with --touch: a finger. Also hold x y, swipe x0 y0 x1 y1
 quit
 ```
+
+`--script file` reads the same lines from a file, where a `wait 500` line
+pauses: the way to drive the app in the iOS simulator, which has no stdin
+(`xcrun simctl launch booted ai.archastro.stet --script /path/to/file`).
 
 Building without HTTPS (`--no-default-features`) drops remote images,
 publishing to Substack, and the only dependency that needs a C compiler for

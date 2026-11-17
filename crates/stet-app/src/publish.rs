@@ -266,7 +266,7 @@ impl Publisher {
         match button {
             "open" => {
                 if let Some(url) = &self.made {
-                    let _ = open::that_detached(url);
+                    let _ = crate::platform::open_url(url);
                 }
                 editor.close_sheet();
             }
