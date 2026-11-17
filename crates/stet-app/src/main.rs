@@ -9,6 +9,8 @@ mod docx;
 mod gdoc;
 mod gpu;
 mod images;
+#[cfg(target_os = "ios")]
+mod ios;
 mod ipynb;
 #[cfg(target_os = "macos")]
 mod macos;
@@ -40,7 +42,12 @@ const USAGE: &str = "stet [options] [file]
   --fonts                 list the installed font families and exit
   -n, --new-window        open a separate window even if stet is already running
   -f, --foreground        stay attached to the terminal until the window closes (also --wait)
-  --drive                 read scripted input from stdin (keys, click, move, drag, scroll, resize, drop, quit)
+  --drive                 read scripted input from stdin (keys, click, move, drag, scroll, resize, drop, quit;
+                          with --touch also tap, hold, swipe)
+  --script <file>         like --drive, read from a file; a `wait <ms>` line pauses (the way to script
+                          an app that has no stdin, such as one in the iOS simulator)
+  --touch                 lay out and behave as on a touch screen (what iPhone and iPad get)
+  --safe <l,t,r,b>        screenshot: points at each edge of the screen the view keeps clear of
   -V, --version           print the version
   -h, --help              this text
 
@@ -62,8 +69,12 @@ pub struct Args {
     pub bench: bool,
     pub fonts: bool,
     pub drive: bool,
+    pub script: Option<PathBuf>,
     pub foreground: bool,
     pub new_window: bool,
+    pub touch: bool,
+    /// Left, top, right, bottom.
+    pub safe: [f32; 4],
 }
 
 impl Args {
@@ -93,6 +104,15 @@ fn parse_args() -> Result<Args, String> {
             "--bench" => args.bench = true,
             "--fonts" => args.fonts = true,
             "--drive" => args.drive = true,
+            "--script" => args.script = Some(PathBuf::from(value("--script")?)),
+            "--touch" => args.touch = true,
+            "--safe" => {
+                let edges: Vec<f32> = value("--safe")?
+                    .split(',')
+                    .filter_map(|edge| edge.trim().parse().ok())
+                    .collect();
+                args.safe = edges.try_into().map_err(|_| "--safe expects left,top,right,bottom")?;
+            }
             "-f" | "--foreground" | "--wait" => args.foreground = true,
             "-n" | "--new-window" => args.new_window = true,
             "--screenshot" => args.screenshot = Some(PathBuf::from(value("--screenshot")?)),
@@ -129,6 +149,16 @@ pub fn build_editor(args: &Args) -> (Editor, Vec<PathBuf>) {
             Ok(parsed) => config = parsed,
             Err(err) => problems.push(format!("config.toml: {err}")),
         }
+    }
+    // A phone's keyboard has no Escape: modal keys are for those who ask.
+    #[cfg(target_os = "ios")]
+    {
+        let asked = dir
+            .as_ref()
+            .and_then(|dir| std::fs::read_to_string(dir.join("config.toml")).ok())
+            .and_then(|source| source.parse::<toml::Table>().ok())
+            .is_some_and(|table| table.contains_key("vim"));
+        config.vim = config.vim && asked;
     }
     let state = platform::State::load();
     let remembered = !args.headless() && !platform::State::older_than_config();
@@ -173,7 +203,9 @@ pub fn build_editor(args: &Args) -> (Editor, Vec<PathBuf>) {
         Some(theme) => editor.theme = theme,
         None => problems.push(format!("no theme named `{wanted}`")),
     }
-    if let Some(file) = &args.file {
+    // Where nothing is opened by name, the last document comes back.
+    let last = platform::recalled(state.last.as_deref());
+    if let Some(file) = args.file.as_ref().or(last.as_ref()) {
         let file = std::path::absolute(file).unwrap_or(file.clone());
         if let Err(err) = editor.open(&file) {
             problems.push(err);
@@ -206,6 +238,24 @@ pub fn timing(step: &str) {
     }
 }
 
+/// An app has no command line: it opens on the folder Files shows as its
+/// own, and the first time, on a note that says what is where.
+#[cfg(target_os = "ios")]
+fn at_home(args: &mut Args) {
+    if let Some(documents) = ios::documents_dir() {
+        let _ = std::fs::create_dir_all(&documents);
+        let _ = std::env::set_current_dir(&documents);
+        let welcome = documents.join("Welcome.md");
+        let fresh = platform::config_dir().is_some_and(|dir| !dir.exists());
+        if fresh && std::fs::write(&welcome, include_str!("welcome-ios.md")).is_ok() {
+            args.file = Some(welcome);
+        }
+    }
+    if let Some(dir) = platform::config_dir() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+}
+
 fn main() {
     START.get_or_init(std::time::Instant::now);
     let raw: Vec<String> = std::env::args().skip(1).collect();
@@ -215,7 +265,8 @@ fn main() {
     if let Some(command) = raw.first().filter(|first| *first == "import" || *first == "export") {
         std::process::exit(convert::cli(command, &raw[1..]));
     }
-    let args = match parse_args() {
+    #[cfg_attr(not(target_os = "ios"), allow(unused_mut))]
+    let mut args = match parse_args() {
         Ok(args) => args,
         Err(err) => {
             if err.is_empty() {
@@ -226,6 +277,8 @@ fn main() {
             std::process::exit(2);
         }
     };
+    #[cfg(target_os = "ios")]
+    at_home(&mut args);
     if args.bench {
         return app::bench(&args);
     }
@@ -248,7 +301,7 @@ fn main() {
     }
     // An stet that is already running takes the file as a tab: no new process,
     // no new window, nothing to wait for.
-    let own_process = args.foreground || args.drive || args.new_window;
+    let own_process = args.foreground || args.drive || args.script.is_some() || args.new_window;
     let files: Vec<String> = args
         .file
         .iter()
@@ -263,7 +316,7 @@ fn main() {
     if !own_process && platform::request(&open, false).is_some() {
         return;
     }
-    if !own_process && detach() {
+    if !own_process && cfg!(not(target_os = "ios")) && detach() {
         return;
     }
     if let Err(err) = app::run(args) {

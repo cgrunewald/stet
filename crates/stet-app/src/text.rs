@@ -84,6 +84,11 @@ impl Fonts {
     /// resolves the configured family preferences to what is installed.
     pub fn new(config: &Config, dirs: &[PathBuf]) -> Fonts {
         let mut system = FontSystem::new();
+        // The font library does not know where iOS keeps its own.
+        #[cfg(target_os = "ios")]
+        for dir in crate::ios::font_dirs() {
+            system.db_mut().load_fonts_dir(dir);
+        }
         for dir in dirs {
             system.db_mut().load_fonts_dir(dir);
         }

@@ -337,7 +337,7 @@ impl Editor {
             cmdline: None,
             completion: None,
             suggesting: false,
-            primary: if cfg!(target_os = "macos") {
+            primary: if cfg!(target_vendor = "apple") {
                 Primary::Super
             } else {
                 Primary::Ctrl

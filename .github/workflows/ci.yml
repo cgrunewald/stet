@@ -105,10 +105,30 @@ jobs:
           test -s target/bundle/Stet.app/Contents/Resources/stet.icns
           target/bundle/Stet.app/Contents/MacOS/stet --version
 
+  # The iPhone and iPad app builds, and bundles into something a simulator takes.
+  ios-app:
+    name: iOS app bundle
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          targets: aarch64-apple-ios, aarch64-apple-ios-sim
+          components: clippy
+      - run: cargo clippy --locked -p stet-app --target aarch64-apple-ios --all-features -- -D warnings
+        env:
+          IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+      - run: make ios-sim
+      - name: Check the bundle
+        run: |
+          plutil -lint target/bundle-ios-sim/Stet.app/Info.plist
+          codesign --verify --strict target/bundle-ios-sim/Stet.app
+          test -s target/bundle-ios-sim/Stet.app/icon-180.png
+
   installer:
     name: Install script
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: sh -n install.sh
-      - run: shellcheck install.sh scripts/install.sh scripts/bundle-macos.sh
+      - run: shellcheck install.sh scripts/install.sh scripts/bundle-macos.sh scripts/bundle-ios.sh

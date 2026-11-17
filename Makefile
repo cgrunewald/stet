@@ -1,4 +1,4 @@
-.PHONY: all build build-release install app install-app test test-all fuzz bench clean release-check fmt lint check setup
+.PHONY: all build build-release install app install-app ios ios-sim ios-run test test-all fuzz bench clean release-check fmt lint check setup
 
 # Default target
 all: build
@@ -24,6 +24,24 @@ install-app: app
 	rm -rf /Applications/Stet.app
 	ditto target/bundle/Stet.app /Applications/Stet.app
 	@echo "Installed /Applications/Stet.app"
+
+# Build Stet.app for iPhone and iPad into target/bundle-ios. Needs Xcode and
+# `rustup target add aarch64-apple-ios`; signed if STET_IOS_IDENTITY and
+# STET_IOS_PROFILE say how (see scripts/bundle-ios.sh).
+IOS_ENV = IPHONEOS_DEPLOYMENT_TARGET=16.0
+ios:
+	$(IOS_ENV) cargo build --release -p stet-app --target aarch64-apple-ios
+	$(IOS_ENV) scripts/bundle-ios.sh target/aarch64-apple-ios/release/stet target/bundle-ios
+
+# The same for the simulator (`rustup target add aarch64-apple-ios-sim`)
+ios-sim:
+	$(IOS_ENV) cargo build -p stet-app --target aarch64-apple-ios-sim
+	$(IOS_ENV) scripts/bundle-ios.sh target/aarch64-apple-ios-sim/debug/stet target/bundle-ios-sim
+
+# Install and start it on the simulator that is running
+ios-run: ios-sim
+	xcrun simctl install booted target/bundle-ios-sim/Stet.app
+	xcrun simctl launch --terminate-running-process booted ai.archastro.stet
 
 # Validate a release candidate. Tagging and pushing stay explicit human actions.
 release-check:

@@ -198,7 +198,7 @@ fn from_browser(id: &str, format: &str, account: Option<&str>) -> Result<(Downlo
     // A little slack for filesystems that keep coarse times.
     let since = SystemTime::now() - Duration::from_secs(2);
     let url = export_url(id, format, account);
-    open::that_detached(&url).map_err(|err| format!("{url}: {err}"))?;
+    crate::platform::open_url(&url).map_err(|err| format!("{url}: {err}"))?;
     eprintln!(
         "stet: not shared by link, so your browser is downloading it as you{}; waiting for it in {}",
         account.map(|account| format!(" ({account})")).unwrap_or_default(),
@@ -301,6 +301,16 @@ fn import_markdown(markdown: &str, out: &Path) -> Result<String, String> {
 
 /// Puts `text`, rendered as `html`, on the system clipboard from the
 /// command line.
+#[cfg(target_os = "ios")]
+pub fn paste(text: String, html: String) -> Result<(), String> {
+    use stet_core::Clipboard;
+    crate::platform::SystemClipboard::default().set_rich(&text, &html);
+    Ok(())
+}
+
+/// Puts `text`, rendered as `html`, on the system clipboard from the
+/// command line.
+#[cfg(not(target_os = "ios"))]
 pub fn paste(text: String, html: String) -> Result<(), String> {
     let mut clipboard = arboard::Clipboard::new().map_err(|err| format!("clipboard: {err}"))?;
     // On Linux the clipboard belongs to whoever set it, so this process

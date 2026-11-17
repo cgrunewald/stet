@@ -89,6 +89,10 @@ pub enum Target {
     /// The dimmed area around the menu.
     Scrim,
     MenuHint,
+    /// The dimmed page beside the file browser, when it is a drawer.
+    SidebarScrim,
+    /// Puts the on-screen keyboard away.
+    KeyboardDone,
 }
 
 /// The sheet as last seen, so it can still be drawn leaving once the
@@ -200,6 +204,16 @@ pub struct View {
     pub zoom: f32,
     /// Height the window's own title bar buttons cover, in pixels.
     pub titlebar: f32,
+    /// Fingers, not a pointer: rows are tall enough to tap, the status line
+    /// carries what a keyboard shortcut would, and a narrow screen shows one
+    /// thing at a time.
+    pub touch: bool,
+    /// The on-screen keyboard is up; the status line offers to put it away.
+    pub keyboard: bool,
+    /// How far past the view's left, top, right and bottom edges the screen
+    /// goes on, in pixels: surfaces that reach an edge run on to the
+    /// screen's own, under its rounded corners and the keyboard.
+    pub bleed: [f32; 4],
     /// Sticky x for consecutive display-line moves.
     pub goal_x: Option<f32>,
     frame: u64,
@@ -295,6 +309,9 @@ impl View {
             scale: 1.0,
             zoom: 1.0,
             titlebar: 0.0,
+            touch: false,
+            keyboard: false,
+            bleed: [0.0; 4],
             goal_x: None,
             frame: 0,
             advance: None,
@@ -502,25 +519,55 @@ impl View {
         self.invalidate();
     }
 
+    /// A row's height, in points: at least a fingertip on a touch screen.
+    fn tap(&self, points: f32) -> f32 {
+        let points = if self.touch { points.max(40.0) } else { points };
+        (points * self.scale).round()
+    }
+
+    /// The whole screen, in the view's coordinates.
+    fn screen(&self) -> [f32; 4] {
+        let [left, top, right, bottom] = self.bleed;
+        [-left, -top, self.width + left + right, self.height + top + bottom]
+    }
+
+    /// On a phone the file browser is a drawer over the page, not a column
+    /// beside it: there is no room for both.
+    pub fn drawer(&self) -> bool {
+        self.touch && self.width < 600.0 * self.scale
+    }
+
     fn sidebar_width(&self, ed: &Editor) -> f32 {
-        if ed.sidebar.visible {
-            (250.0 * self.scale).min(self.width * 0.38).round()
-        } else {
+        if !ed.sidebar.visible {
             0.0
+        } else if self.drawer() {
+            (320.0 * self.scale).min(self.width * 0.86).round()
+        } else {
+            (250.0 * self.scale).min(self.width * 0.38).round()
         }
     }
 
-    /// Where the document pane ends and the margin begins, if it is open.
+    /// The width the file browser takes from the editor area.
+    fn chrome_width(&self, ed: &Editor) -> f32 {
+        if self.drawer() { 0.0 } else { self.sidebar_width(ed) }
+    }
+
+    /// True if the document and its margin fit side by side. A touch screen
+    /// too narrow for two columns of writing shows the one being written in.
+    fn beside(&self, ed: &Editor) -> bool {
+        !self.touch || self.width - self.chrome_width(ed) >= 560.0 * self.scale
+    }
+
+    /// Where the document pane ends and the margin begins, if both show.
     fn split(&self, ed: &Editor) -> Option<f32> {
-        let chrome = self.sidebar_width(ed);
-        ed.margin_visible()
-            .then(|| (chrome + (self.width - chrome) * self.split_share).round())
+        let chrome = self.chrome_width(ed);
+        (ed.margin_visible() && self.beside(ed)).then(|| (chrome + (self.width - chrome) * self.split_share).round())
     }
 
     /// Moves the line between the document and the margin to window x
     /// position `x`, leaving each pane room to write in.
     pub fn drag_split(&mut self, ed: &Editor, x: f32) {
-        let chrome = self.sidebar_width(ed);
+        let chrome = self.chrome_width(ed);
         let room = (self.width - chrome).max(1.0);
         let least = (240.0 * self.scale / room).min(0.5);
         self.split_share = ((x - chrome) / room).clamp(least, 1.0 - least);
@@ -529,14 +576,18 @@ impl View {
     /// True if the margin is drawn as notes beside their pins, which move
     /// with the document and not on their own.
     pub fn notes_beside(&self, ed: &Editor) -> bool {
-        ed.margin_visible() && !ed.in_margin() && ed.config.pinned_notes && self.pins.iter().any(|pin| pin.pinned())
+        ed.margin_visible()
+            && self.beside(ed)
+            && !ed.in_margin()
+            && ed.config.pinned_notes
+            && self.pins.iter().any(|pin| pin.pinned())
     }
 
     /// True if a window x position is over the pane that does not have the
     /// keyboard.
     pub fn over_other_pane(&self, ed: &Editor, x: f32) -> bool {
         self.split(ed)
-            .is_some_and(|split| (x >= split) != ed.in_margin() && x >= self.sidebar_width(ed))
+            .is_some_and(|split| (x >= split) != ed.in_margin() && x >= self.chrome_width(ed))
     }
 
     fn metrics(&mut self, ed: &Editor) -> Metrics {
@@ -569,7 +620,7 @@ impl View {
         };
         // With the margin open the editor area is two panes; these are the
         // metrics of whichever one `ed` currently holds.
-        let chrome = self.sidebar_width(ed);
+        let chrome = self.chrome_width(ed);
         let (origin, right) = match self.split(ed) {
             Some(split) if ed.in_margin() => (split, self.width),
             Some(split) => (chrome, split),
@@ -583,12 +634,8 @@ impl View {
             .max(advance * 12.0)
             .round();
         let ui = (13.0 * self.scale).round();
-        let row = (28.0 * self.scale).round();
-        let top = if ed.tab_count() > 1 {
-            (36.0 * self.scale).round()
-        } else {
-            0.0
-        };
+        let row = self.tap(28.0);
+        let top = if ed.tab_count() > 1 { self.tap(36.0) } else { 0.0 };
         Metrics {
             font,
             line,
@@ -600,7 +647,14 @@ impl View {
             chrome,
             top,
             top_pad: top + (line * 1.6).round(),
-            bottom: (self.height - line * 1.5).round(),
+            // The status line: on a touch screen, tall enough to tap.
+            bottom: (self.height
+                - if self.touch {
+                    (line * 1.5).max(self.tap(0.0))
+                } else {
+                    line * 1.5
+                })
+            .round(),
             ui,
             row,
         }
@@ -1182,8 +1236,9 @@ impl View {
         self.pins = if ed.margin_visible() { ed.pins() } else { Vec::new() };
         // The document first: where its lines fall decides where pinned
         // notes go.
-        let reveal = ed.margin_visible() && ed.take_reveal();
-        if ed.margin_visible() && ed.in_margin() {
+        let two = ed.margin_visible() && self.beside(ed);
+        let reveal = two && ed.take_reveal();
+        if two && ed.in_margin() {
             let mut layer = std::mem::take(&mut frame.base);
             ed.with_other_pane(|document| {
                 document.refresh();
@@ -1196,7 +1251,7 @@ impl View {
             self.body(ed, &mut frame.base, true);
         } else {
             self.body(ed, &mut frame.base, true);
-            if ed.margin_visible() {
+            if two {
                 let mut layer = std::mem::take(&mut frame.base);
                 let beside = self.notes_beside(ed);
                 ed.with_other_pane(|margin| {
@@ -1226,7 +1281,9 @@ impl View {
 
         self.status(ed, &m, &mut frame.base);
         self.tabs(ed, &m, &mut frame.base);
-        self.sidebar(ed, &m, &mut frame.base);
+        // A drawer lies over the page; a column stands beside it.
+        let drawer = self.drawer();
+        self.sidebar(ed, &m, if drawer { &mut frame.over } else { &mut frame.base });
         self.chart_readout(ed, &m, &mut frame.over);
         self.preview_panel(ed, &m, &mut frame.over);
         self.chip_card(ed, &m, &mut frame.over);
@@ -1251,8 +1308,17 @@ impl View {
     fn margin_surface(&mut self, ed: &Editor, m: &Metrics, layer: &mut Layer, focused: bool) {
         let c = ed.theme.colors;
         let hairline = self.scale.max(1.0);
+        // To the screen's own edges, wherever the pane reaches the view's.
+        let [_, screen_top, screen_width, screen_height] = self.screen();
+        let left = if m.origin <= 0.0 { -self.bleed[0] } else { m.origin };
+        let top = if m.top <= 0.0 { screen_top } else { m.top };
+        let right = if m.right >= self.width {
+            screen_width - self.bleed[0]
+        } else {
+            m.right
+        };
         layer.back.push(Quad {
-            rect: [m.origin, m.top, m.right - m.origin, self.height - m.top],
+            rect: [left, top, right - left, screen_height + screen_top - top],
             color: linear(c.panel, 1.0),
             radius: 0.0,
         });
@@ -1678,7 +1744,19 @@ impl View {
             1 => "1 suggestion    ".to_string(),
             count => format!("{count} suggestions    "),
         };
-        let hint = format!("{} menu", ed.chord(false, "/"));
+        // A finger has no ⌘/: the word is the button.
+        let hint = if self.touch {
+            "menu".to_string()
+        } else {
+            format!("{} menu", ed.chord(false, "/"))
+        };
+        // Beside it, while the on-screen keyboard is up, the way to put it away.
+        let done = if self.touch && self.keyboard { "done" } else { "" };
+        let buttons = if done.is_empty() {
+            hint.clone()
+        } else {
+            format!("{done}    {hint}")
+        };
         // Who is on the other end of `stet ctl wait`, if anyone.
         let agent = match &ed.agent {
             Some(agent) if agent.listening => format!("● {}    ", agent.name),
@@ -1703,29 +1781,51 @@ impl View {
                     .collect()
             })
             .unwrap_or_default();
-        let right_text = format!(
-            "{pending}    {agent}{kernels}{suggestions}{}{dirty}    {} words    {}:{}    {hint}",
+        let full = format!(
+            "{pending}    {agent}{kernels}{suggestions}{}{dirty}    {} words    {}:{}    {buttons}",
             ed.file_name(),
             ed.doc().words,
             line + 1,
             col + 1
         );
-        let key = self.label(ed, right_text.trim_start(), c.status, size, Face::Mono, false);
-        let width = self.layouts[&key].rows[0].width;
-        // Yield to a long message rather than overlap it.
-        if m.chrome + pad + left_width + pad < self.width - pad - width {
+        // Yield to a long message rather than overlap it. On a touch screen
+        // the buttons are the way to everything else, so what is said beside
+        // them gives way first and they stay.
+        let mut choices = vec![full];
+        if self.touch {
+            choices.push(format!("{}{dirty}    {buttons}", ed.file_name()));
+            choices.push(buttons.clone());
+        }
+        let room = self.width - pad - (m.chrome + pad + left_width + pad);
+        for (index, text) in choices.iter().enumerate() {
+            let text = text.trim_start();
+            let key = self.label(ed, text, c.status, size, Face::Mono, false);
+            let width = self.layouts[&key].rows[0].width;
+            let last = index + 1 == choices.len();
+            if width >= room && !(last && self.touch) {
+                continue;
+            }
             self.put(layer, key, self.width - pad - width, middle, clip, c.status);
-            let hint_width =
-                hint.chars().count() as f32 * width / right_text.trim_start().chars().count().max(1) as f32;
+            // Each button is its word and half the gap either side of it.
+            let advance = width / text.chars().count().max(1) as f32;
+            let (hint_width, done_width) = (
+                hint.chars().count() as f32 * advance,
+                done.chars().count() as f32 * advance,
+            );
+            let reach = (advance * 2.0).min(pad);
+            let menu_left = self.width - pad - hint_width - reach;
             self.targets.push((
-                [
-                    self.width - pad - hint_width,
-                    m.bottom,
-                    hint_width + pad,
-                    self.height - m.bottom,
-                ],
+                [menu_left, m.bottom, self.width - menu_left, self.height - m.bottom],
                 Target::MenuHint,
             ));
+            if !done.is_empty() {
+                let done_left = menu_left - reach - done_width - reach;
+                self.targets.push((
+                    [done_left, m.bottom, menu_left - done_left, self.height - m.bottom],
+                    Target::KeyboardDone,
+                ));
+            }
+            break;
         }
     }
 
@@ -1793,14 +1893,25 @@ impl View {
             return;
         }
         let c = ed.theme.colors;
-        let width = m.chrome;
+        let width = self.sidebar_width(ed);
+        let screen = self.screen();
+        if self.drawer() {
+            // The page behind dims, and a tap on it puts the drawer away.
+            layer.back.push(Quad {
+                rect: screen,
+                color: [0.0, 0.0, 0.0, 0.28],
+                radius: 0.0,
+            });
+            self.targets
+                .push(([0.0, 0.0, self.width, self.height], Target::SidebarScrim));
+        }
         layer.back.push(Quad {
-            rect: [0.0, 0.0, width, self.height],
+            rect: [screen[0], screen[1], width - screen[0], screen[3]],
             color: linear(c.panel, 1.0),
             radius: 0.0,
         });
         layer.back.push(Quad {
-            rect: [width - self.scale.max(1.0), 0.0, self.scale.max(1.0), self.height],
+            rect: [width - self.scale.max(1.0), screen[1], self.scale.max(1.0), screen[3]],
             color: linear(c.rule, 0.6),
             radius: 0.0,
         });
@@ -1892,7 +2003,7 @@ impl View {
         let Some(menu) = &ed.context_menu else { return };
         let c = ed.theme.colors;
         let s = self.scale;
-        let row = (28.0 * s).round();
+        let row = self.tap(28.0);
         let pad = (12.0 * s).round();
         let gap = (9.0 * s).round();
         let labels: Vec<(u64, Option<u64>)> = menu
@@ -2117,7 +2228,7 @@ impl View {
         let left = ((self.width - width) / 2.0).round();
         let top = (self.height * 0.14).max(self.titlebar + 12.0 * s).round();
         let input_height = (48.0 * s).round();
-        let row = (32.0 * s).round();
+        let row = self.tap(32.0);
         let footer = (30.0 * s).round();
         let pad = (16.0 * s).round();
         let rule = (9.0 * s).round();
@@ -2169,7 +2280,7 @@ impl View {
 
         // The page dims with the panel, unless the menu had dimmed it already.
         layer.back.push(Quad {
-            rect: [0.0, 0.0, self.width, self.height],
+            rect: self.screen(),
             color: [0.0, 0.0, 0.0, 0.28 * if pushed { 1.0 } else { open }],
             radius: 0.0,
         });
@@ -2352,7 +2463,7 @@ impl View {
         let open = retouch.openness(self.now);
         let black = |alpha: f32| [0.0, 0.0, 0.0, alpha];
         layer.back.push(Quad {
-            rect: [0.0, 0.0, self.width, self.height],
+            rect: self.screen(),
             color: black(0.78 * open),
             radius: 0.0,
         });
@@ -2641,17 +2752,21 @@ impl View {
             self.palette_scroll = 0;
             return;
         };
-        const ROWS: usize = 11;
         let c = ed.theme.colors;
         let s = self.scale;
         let width = (640.0 * s).min(self.width - 32.0 * s).round();
         let left = ((self.width - width) / 2.0).round();
         let top = (self.height * 0.14).max(self.titlebar + 12.0 * s).round();
         let input_height = (48.0 * s).round();
-        let row = (32.0 * s).round();
+        let row = self.tap(32.0);
         let header = (26.0 * s).round();
         let footer = (30.0 * s).round();
         let pad = (16.0 * s).round();
+        // As many rows as fit above the bottom of the view, which on a phone
+        // is the top of the keyboard; eleven where there is room for them.
+        let room = self.height - top - input_height - header * 2.0 - footer - 24.0 * s;
+        #[allow(non_snake_case)]
+        let ROWS = ((room / row).floor().max(3.0) as usize).min(11);
 
         let count = palette.matches.len();
         if palette.selected < self.palette_scroll {
@@ -2673,7 +2788,7 @@ impl View {
         let height = input_height + list_height + footer + 8.0 * s;
 
         layer.back.push(Quad {
-            rect: [0.0, 0.0, self.width, self.height],
+            rect: self.screen(),
             color: [0.0, 0.0, 0.0, 0.28],
             radius: 0.0,
         });

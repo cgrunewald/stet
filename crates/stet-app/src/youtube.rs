@@ -192,7 +192,7 @@ impl Connector {
                         return;
                     }
                 };
-                if let Err(err) = open::that_detached(&begun.url) {
+                if let Err(err) = crate::platform::open_url(&begun.url) {
                     sheet.status = Some((format!("cannot open the browser: {err}"), true));
                     return;
                 }

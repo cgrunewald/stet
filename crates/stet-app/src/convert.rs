@@ -208,7 +208,7 @@ fn reveal(path: &Path) {
         false
     };
     if !shown && let Some(folder) = path.parent() {
-        let _ = open::that_detached(folder);
+        let _ = crate::platform::open_url(&folder.to_string_lossy());
     }
 }
 
@@ -227,7 +227,7 @@ pub fn finish(exported: &Exported, account: Option<&str>, open: bool) -> String 
                 let url = account.map_or(NEW_DOC.to_string(), |_| {
                     as_account("https://docs.google.com/document/create")
                 });
-                let _ = open::that_detached(url);
+                let _ = crate::platform::open_url(&url);
             }
             let paste = if cfg!(target_os = "macos") { "⌘V" } else { "Ctrl+V" };
             format!("copied; {paste} in a new Google Doc")
@@ -235,7 +235,7 @@ pub fn finish(exported: &Exported, account: Option<&str>, open: bool) -> String 
         Exported::Upload(path) => {
             if open {
                 reveal(path);
-                let _ = open::that_detached(as_account(DRIVE));
+                let _ = crate::platform::open_url(&as_account(DRIVE));
             }
             format!(
                 "wrote {} with its suggestions and notes; drop it into Google Drive and open it with Google Docs",
