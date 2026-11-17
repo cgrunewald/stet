@@ -278,7 +278,10 @@ fn main() {
         }
     };
     #[cfg(target_os = "ios")]
-    at_home(&mut args);
+    {
+        ios::register_scene_delegate();
+        at_home(&mut args);
+    }
     if args.bench {
         return app::bench(&args);
     }

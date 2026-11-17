@@ -33,6 +33,134 @@ static SINK: OnceLock<Box<dyn Fn(AppEvent) + Send + Sync>> = OnceLock::new();
 /// Where the on-screen keyboard will rest, in screen coordinates.
 static KEYBOARD: Mutex<Option<CGRect>> = Mutex::new(None);
 
+/// The window scene stet is shown in, once the system has connected it, and
+/// the windows made before it was, waiting for it. Pointers, as addresses:
+/// both live for the life of the app and are only touched on the main thread.
+struct Scenes {
+    scene: Option<usize>,
+    waiting: Vec<usize>,
+}
+
+static SCENES: Mutex<Scenes> = Mutex::new(Scenes {
+    scene: None,
+    waiting: Vec::new(),
+});
+
+/// Puts `window` in `scene`, sized to it, and shows it.
+///
+/// # Safety
+/// Both are live: a UIWindow and a UIWindowScene, on the main thread.
+unsafe fn place(window: *mut AnyObject, scene: *mut AnyObject) {
+    // SAFETY: plain setters and accessors on the live objects the caller
+    // vouches for.
+    unsafe {
+        let _: () = msg_send![window, setWindowScene: scene];
+        let space: *mut AnyObject = msg_send![scene, coordinateSpace];
+        let bounds: CGRect = msg_send![space, bounds];
+        let _: () = msg_send![window, setFrame: bounds];
+        let _: () = msg_send![window, makeKeyAndVisible];
+    }
+}
+
+/// Shows the window `view` belongs to in stet's scene: now, if the system has
+/// connected it, or as soon as it does. Since iOS 27 an app's windows live in
+/// a scene, and the windowing library makes its window before there is one.
+pub fn adopt(view: *mut std::ffi::c_void) {
+    let view = view.cast::<AnyObject>();
+    if view.is_null() {
+        return;
+    }
+    // SAFETY: `view` is the live UIView of the window just made.
+    let window: *mut AnyObject = unsafe { msg_send![view, window] };
+    if window.is_null() {
+        return;
+    }
+    let mut scenes = SCENES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match scenes.scene {
+        // SAFETY: the scene is kept for the life of the app; both are live.
+        Some(scene) => unsafe { place(window, scene as *mut AnyObject) },
+        None => scenes.waiting.push(window as usize),
+    }
+}
+
+/// Sends on the documents in a set of UIOpenURLContext.
+///
+/// # Safety
+/// `contexts` is nil or a live NSSet of UIOpenURLContext.
+unsafe fn open_contexts(contexts: *mut AnyObject) {
+    if contexts.is_null() {
+        return;
+    }
+    let mut files = Vec::new();
+    // SAFETY: each context's `URL` is a live NSURL; see `handed_over`.
+    unsafe {
+        let all: Retained<NSArray<AnyObject>> = msg_send_id![contexts, allObjects];
+        for context in all.iter() {
+            let url: *mut NSURL = msg_send![context, URL];
+            let Some(url) = url.as_ref() else { continue };
+            let _: bool = msg_send![url, startAccessingSecurityScopedResource];
+            if let Some(path) = url.path() {
+                files.push(PathBuf::from(path.to_string()));
+            }
+        }
+    }
+    if !files.is_empty() {
+        send(AppEvent::Open(files));
+    }
+}
+
+extern "C" fn scene_connected(
+    _this: &AnyObject,
+    _cmd: Sel,
+    scene: *mut AnyObject,
+    _session: *mut AnyObject,
+    options: *mut AnyObject,
+) {
+    let mut scenes = SCENES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // SAFETY: the system keeps the scene for as long as it is connected; it
+    // is retained here so the address stays good for the life of the app.
+    std::mem::forget(unsafe { Retained::retain(scene) });
+    scenes.scene = Some(scene as usize);
+    for window in std::mem::take(&mut scenes.waiting) {
+        // SAFETY: windows the windowing library made and keeps; the scene
+        // was just handed over.
+        unsafe { place(window as *mut AnyObject, scene) };
+    }
+    drop(scenes);
+    // SAFETY: connection options are live; their URL contexts are a set.
+    unsafe {
+        if !options.is_null() {
+            let contexts: *mut AnyObject = msg_send![options, URLContexts];
+            open_contexts(contexts);
+        }
+    }
+}
+
+extern "C" fn scene_opened(_this: &AnyObject, _cmd: Sel, _scene: *mut AnyObject, contexts: *mut AnyObject) {
+    // SAFETY: the system passes a live set of UIOpenURLContext.
+    unsafe { open_contexts(contexts) };
+}
+
+/// The class Info.plist names as the scene delegate. Registered before
+/// `UIApplicationMain`, which asks for it while connecting the first scene.
+pub fn register_scene_delegate() {
+    let Some(mut builder) = ClassBuilder::new("StetSceneDelegate", class!(UIResponder)) else {
+        return;
+    };
+    if let Some(protocol) = objc2::runtime::AnyProtocol::get("UIWindowSceneDelegate") {
+        builder.add_protocol(protocol);
+    }
+    // SAFETY: each function has the signature its selector is sent with.
+    unsafe {
+        builder.add_method(
+            sel!(scene:willConnectToSession:options:),
+            scene_connected as extern "C" fn(_, _, _, _, _),
+        );
+        builder.add_method(sel!(scene:openURLContexts:), scene_opened as extern "C" fn(_, _, _, _));
+    }
+    builder.register();
+}
+
 fn send(event: AppEvent) {
     if let Some(sink) = SINK.get() {
         sink(event);

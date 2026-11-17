@@ -105,6 +105,25 @@ cat > "$app/Info.plist" <<PLIST
         <string>UIInterfaceOrientationLandscapeLeft</string>
         <string>UIInterfaceOrientationLandscapeRight</string>
     </array>
+    <!-- One window scene, which iOS 27 requires of every app; its delegate
+         is the class ios.rs registers before the app starts. -->
+    <key>UIApplicationSceneManifest</key>
+    <dict>
+        <key>UIApplicationSupportsMultipleScenes</key>
+        <false/>
+        <key>UISceneConfigurations</key>
+        <dict>
+            <key>UIWindowSceneSessionRoleApplication</key>
+            <array>
+                <dict>
+                    <key>UISceneConfigurationName</key>
+                    <string>Default</string>
+                    <key>UISceneDelegateClassName</key>
+                    <string>StetSceneDelegate</string>
+                </dict>
+            </array>
+        </dict>
+    </dict>
     <key>UIApplicationSupportsIndirectInputEvents</key>
     <true/>
     <!-- The app's folder shows in Files, and documents open where they are. -->

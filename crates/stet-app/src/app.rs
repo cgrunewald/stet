@@ -371,6 +371,13 @@ impl Running {
         }
         let window = Arc::new(event_loop.create_window(attributes).map_err(|err| err.to_string())?);
         crate::timing("window created");
+        #[cfg(target_os = "ios")]
+        {
+            use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(RawWindowHandle::UiKit(handle)) = window.window_handle().map(|handle| handle.as_raw()) {
+                crate::ios::adopt(handle.ui_view.as_ptr());
+            }
+        }
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(Box::new(
             event_loop.owned_display_handle(),
