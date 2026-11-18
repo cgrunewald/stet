@@ -17,6 +17,6 @@ arrow-ipc = "60"
 arrow-array = "60"
 arrow-schema = "60"
 arrow-cast = { version = "60", default-features = false }
-rusqlite = { version = "0.41", features = ["bundled"] }
+rusqlite = { version = "0.42", features = ["bundled"] }
 
 [dev-dependencies]
